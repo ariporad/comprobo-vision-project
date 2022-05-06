@@ -3,6 +3,7 @@ import functools
 from time import perf_counter
 from collections import defaultdict
 from contextlib import contextmanager
+from typing import Optional
 
 _timings = defaultdict(lambda: [])
 
@@ -69,3 +70,30 @@ def clear_timings():
 
 def normalize(v, *args, **kwargs):
 	return v / np.linalg.norm(v, *args, **kwargs)
+
+
+def plot_trajectory(ax, poses, label: Optional[str] = None, scale_factor=1.0, line_color='r', arrow_color='b', arrow_size=5, arrow_prop=5, show_arrows=True, autoscale=True):
+	XYZ = np.array([P @ np.array([[0, 0, 0, 1]]).transpose()
+				   for P in poses]).squeeze(axis=2)
+	UVW = np.array([normalize(P @ np.array([[0, 0, 1, 1]]).transpose())
+				   * arrow_size for P in poses]).squeeze(axis=2)
+
+	XYZ *= float(scale_factor)
+	UVW *= float(scale_factor)
+
+	if autoscale:
+		MIN = np.min([0, np.min(XYZ), *ax.get_xlim(),
+					 *ax.get_ylim(), *ax.get_zlim()])
+		MAX = np.max([np.max(XYZ), *ax.get_xlim(), *
+					 ax.get_ylim(), *ax.get_zlim()]) * 1.10
+
+	if show_arrows:
+		ax.quiver(
+		    XYZ[::arrow_prop, 0], XYZ[::arrow_prop, 1], XYZ[::arrow_prop, 2],
+		    UVW[::arrow_prop, 0], UVW[::arrow_prop, 1], UVW[::arrow_prop, 2], color=arrow_color)
+	ax.plot(XYZ[:, 0], XYZ[:, 1], XYZ[:, 2], line_color, label=label)
+
+	if autoscale:
+		ax.set_xlim(MIN, MAX)
+		ax.set_ylim(MIN, MAX)
+		ax.set_zlim(MIN, MAX)

@@ -1,138 +1,24 @@
 # %%
 ## Setup ##
 # %matplotlib notebook
+# %load_ext autoreload
+%autoreload 2
 
-from scipy.optimize import least_squares
-from scipy.sparse import lil_matrix
-from itertools import islice
-from dataclasses import dataclass, field
-from typing import Tuple, Optional, Dict, Iterable, List
-from collections import namedtuple
+from functools import cached_property
 import cv2
 import pykitti
 import numpy as np
 from matplotlib import pyplot as plt
+from typing import Iterable, List
+from scipy.optimize import least_squares
+from scipy.sparse import lil_matrix
 
-from helpers import print_timings, timed, normalize	
+from helpers import timed, plot_trajectory
+from point_cloud import PointCloud
 
 KITTI_DIR = 'kitti'
 
-
-def plot_trajectory(ax, poses, label: Optional[str] = None, scale_factor=1.0, line_color='r', arrow_color='b', arrow_size=5, arrow_prop=5, show_arrows=True, autoscale=True):
-	XYZ = np.array([P @ np.array([[0, 0, 0, 1]]).transpose()
-				   for P in poses]).squeeze(axis=2)
-	UVW = np.array([normalize(P @ np.array([[0, 0, 1, 1]]).transpose())
-				   * arrow_size for P in poses]).squeeze(axis=2)
-
-	XYZ *= float(scale_factor)
-	UVW *= float(scale_factor)
-
-	if autoscale:
-		MIN = np.min([0, np.min(XYZ), *ax.get_xlim(),
-					 *ax.get_ylim(), *ax.get_zlim()])
-		MAX = np.max([np.max(XYZ), *ax.get_xlim(), *
-					 ax.get_ylim(), *ax.get_zlim()]) * 1.10
-
-	if show_arrows:
-		ax.quiver(
-		    XYZ[::arrow_prop, 0], XYZ[::arrow_prop, 1], XYZ[::arrow_prop, 2],
-		    UVW[::arrow_prop, 0], UVW[::arrow_prop, 1], UVW[::arrow_prop, 2], color=arrow_color)
-	ax.plot(XYZ[:, 0], XYZ[:, 1], XYZ[:, 2], line_color, label=label)
-
-	if autoscale:
-		ax.set_xlim(MIN, MAX)
-		ax.set_ylim(MIN, MAX)
-		ax.set_zlim(MIN, MAX)
-
-# %%
 ### Feature Detection ###
-
-@dataclass
-class PointCloud:
-	# Storing all the data twice is inefficient memory-wise, but allows for fast lookups in either direction
-	_points3d: Dict[Tuple[float, float, float], Dict[int,
-													 Tuple[float, float]]] = field(default_factory=lambda: {})
-	_points2d: Dict[int, Dict[Tuple[float, float], Tuple[float,
-														 float, float]]] = field(default_factory=lambda: {})
-	_num_observations: int = 0
-
-	@timed
-	def _canonicalize2d(self, point2d):
-		point2d = np.array(point2d).squeeze()
-
-		if point2d.shape == (3,):
-			assert point2d[2] == 1.0, "Invalid homogeneous 2d point! 3rd value must be 1.0!"
-			point2d = point2d[:2]
-
-		assert point2d.shape == (2,), "Invalid 2d point!"
-
-		return point2d
-
-	@timed
-	def _canonicalize3d(self, point3d):
-		point3d = np.array(point3d).squeeze()
-
-		if point3d.shape == (4,):
-			assert point3d[3] == 1.0, "Invalid homogeneous 3d point! 4th value must be 1.0!"
-			point3d = point3d[:3]
-
-		assert point3d.shape == (3,), "Invalid 3d point!"
-
-		return point3d
-
-	@timed
-	def set2d(self, frame_id, point3d, point2d) -> bool:
-		""" Record an observation. Returns True if this observation is new, False otherwise."""
-		key3d = tuple(self._canonicalize3d(point3d))
-		value2d = tuple(self._canonicalize2d(point2d))
-
-		if key3d not in self._points3d:
-			self._points3d[key3d] = {}
-
-		if frame_id not in self._points2d:
-			self._points2d[frame_id] = {}
-
-		if self._points3d[key3d].get(frame_id, None) == value2d:
-			return False
-
-		self._points3d[key3d][frame_id] = value2d
-		self._points2d[frame_id][value2d] = key3d
-		self._num_observations += 1
-
-		return True
-
-	@timed
-	def lookup2d(self, frame_id, point2d):
-		value2d = tuple(self._canonicalize2d(point2d))
-
-		return self._points2d.get(frame_id, {}).get(value2d, None)
-
-	@timed
-	def lookup3d(self, point3d):
-		key3d = tuple(self._canonicalize3d(point3d))
-
-		for frame_id, value2d in self._points3d[key3d].items():
-			yield frame_id, np.array(value2d)
-
-	@property
-	def num_observations(self) -> int:
-		return self._num_observations
-
-	@property
-	def num_points3d(self) -> int:
-		return len(self._points3d)
-
-	@property
-	def points3d(self) -> Iterable[np.array]:
-		return (np.array(key3d) for key3d in self._points3d.keys())
-
-	@property
-	def observations(self) -> Iterable[Tuple[int, np.array, np.array]]:
-		""" Return (frame_id, point2d, point3d) tuples of each observation. """
-		for key3d, frame_dict in self._points3d.items():
-			point3d = np.array(key3d)
-			for frame_id, tuple2d in frame_dict:
-				yield frame_id, point3d, np.array(tuple2d)
 
 class VOdom:
 	sift = cv2.SIFT_create()
@@ -154,30 +40,28 @@ class VOdom:
 		# Find Matches
 		# From: https://stackoverflow.com/a/33670318
 		with timed('SIFT'):
-			kp1, des1 = self.sift.detectAndCompute(img1, None)
-			kp2, des2 = self.sift.detectAndCompute(img2, None)
+			keypoints1, descriptors1 = self.sift.detectAndCompute(img1, None)
+			keypoints2, descriptors2 = self.sift.detectAndCompute(img2, None)
 		with timed('Matching'):
-			matches = self.bf_matcher.match(des1, des2)
-
-		matches = sorted(matches, key=lambda x: x.distance)
+			matches = self.bf_matcher.match(descriptors1, descriptors2)
 
 		if draw:
 			match_img = cv2.drawMatches(
-				img1, kp1, img2, kp2, matches, None, flags=2)
+				img1, keypoints1, img2, keypoints2, matches, None, flags=2)
 			plt.figure(figsize=(9, 3))
 			plt.imshow(match_img)
 			plt.show()
 
 		# Find Points
 		# From book
-		imgpts1 = []
-		imgpts2 = []
+		pts1 = []
+		pts2 = []
 		for match in matches:
-			imgpts1.append(kp1[match.queryIdx].pt)
-			imgpts2.append(kp2[match.trainIdx].pt)
+			pts1.append(keypoints1[match.queryIdx].pt)
+			pts2.append(keypoints2[match.trainIdx].pt)
 
-		points1 = np.array(imgpts1)
-		points2 = np.array(imgpts2)
+		points1 = np.array(pts1)
+		points2 = np.array(pts2)
 
 		with timed('findFundamentalMat'):
 			F, status_mask = cv2.findFundamentalMat(
@@ -245,35 +129,29 @@ class VOdom:
 		_, X = cv2.solve(A, B, flags=cv2.DECOMP_SVD)
 		return np.array([*X[:, 0], 1.0])
 
+	@cached_property
+	def K_inv(self):
+		return np.linalg.inv(self.K)
+
 	# From book
 	@timed
 	def triangulate_points(
 		self,
 			frame_id: int,
-			pt_set1: np.array,
-			pt_set2: np.array,
+			points0: np.array,
+			points1: np.array,
 			P0: np.array,
 			P1: np.array,
 	):
-		Kinv = np.linalg.inv(self.K) # TODO: cache
-		reproj_error = []
-
-		for i in range(len(pt_set1)):
+		for point0, point1 in zip(points0, points1):
 			# Convert to normalized, homogeneous coordinates
-			u0 = Kinv @ np.array([*pt_set1[i], 1.0])
-			u1 = Kinv @ np.array([*pt_set2[i], 1.0])
+			u0 = self.K_inv @ np.array([*point0, 1.0])
+			u1 = self.K_inv @ np.array([*point1, 1.0])
 
 			# Triangulate
 			X = self.triangulate(u0, P0, u1, P1)
 
-			if self.point_cloud.set2d(frame_id, X, pt_set2[i]):
-				# Calculate reprojection error
-				reproj = self.K @ P1 @ X
-				reproj_normalized = reproj[0:1] / reproj[2]
-				reproj_error.append(np.linalg.norm(reproj_normalized))
-
-		# Return mean reprojection error
-		return np.mean(reproj_error)
+			self.point_cloud.set2d(frame_id, X, point1)
 
 	@timed
 	def P_from_PnP(self, points3d, points2d):
@@ -312,21 +190,21 @@ class VOdom:
 				img0, img1 = img1, img
 				points0, points1, matches, _ = self.detect_matches_and_E(
 					img0, img1, draw=False)
-				points1_valid = []
+
+				points3d_valid = []
+				points2d_valid = [] # All in frame1
 
 				for point0, point1 in zip(points0, points1):
 					point3d = self.point_cloud.lookup2d(frame_id - 1, point0)
 					if point3d is not None:
-						points1_valid.append((point3d, point1))
+						points3d_valid.append(point3d)
+						points2d_valid.append(point1)
 
 				P0 = P1
-				P1, R, t = self.P_from_PnP(
-					[point3d for point3d, _ in points1_valid],
-					[ point1 for _, point1 in points1_valid]
-				)
+				P1, R, t = self.P_from_PnP(points3d_valid, points2d_valid)
 				Ps.append(P1)
 
-				err = self.triangulate_points(frame_id, points0, points1, P0, P1)
+				self.triangulate_points(frame_id, points0, points1, P0, P1) # updates point cloud
 
 		return Ps
 
@@ -343,41 +221,16 @@ class VOdom:
 		return poses
 
 
-	# fig = plt.figure()
-	# ax = fig.add_subplot(projection='3d')
-	# ax.set_xlim(0, 1)
-	# ax.set_ylim(0, 1)
-	# ax.set_zlim(0, 1)
-	# plot_trajectory(ax, poses)
-	# plot_trajectory(ax, ground_truth_poses[:len(poses)], 50, 'g', 'g')
-
-	# ax.set_xlabel('X')
-	# ax.set_ylabel('Y')
-	# ax.set_zlabel('Z')
-
-	# ax.view_init(0, 90)
-	# ax.set_title("Trajectory (Bird's-Eye View, Z is forward)")
-	# plt.show()
-
-	# ## Bundle Adjustment
+	## Bundle Adjustment
 	# Based on this tutorial: https://scipy-cookbook.readthedocs.io/items/bundle_adjustment.html, but mostly re-written (except as otherwise marked).
 
-	# K includes 5 dof which are constant for all frames:
-	# - translation (2 dof: cx, cy)
-	# - focal length/change of units (2 dof: fx/alpha, fy/beta)
-	# - skewness (1 dof: theta)
-	# R and t are provided on a per-frame basis (??? dof, does t overlap with translation in K?)
-
-	"""
-	Relevant data, in their implementation:
-	- camera_params with shape (n_cameras, 9) contains initial estimates of parameters for all cameras. First 3 components in each row form a rotation vector (https://en.wikipedia.org/wiki/Rodrigues%27_rotation_formula), next 3 components form a translation vector, then a focal distance and two distortion parameters.
-	- points_3d with shape (n_points, 3) contains initial estimates of point coordinates in the world frame.
-	- camera_ind with shape (n_observations,) contains indices of cameras (from 0 to n_cameras - 1) involved in each observation.
-	- point_ind with shape (n_observations,) contatins indices of points (from 0 to n_points - 1) involved in each observation.
-	- points_2d with shape (n_observations, 2) contains measured 2-D coordinates of points projected on images in each observations.
-	"""
-
-
+	
+	# Relevant data, in their implementation:
+	# - camera_params with shape (n_cameras, 9) contains initial estimates of parameters for all cameras. First 3 components in each row form a rotation vector (https://en.wikipedia.org/wiki/Rodrigues%27_rotation_formula), next 3 components form a translation vector, then a focal distance and two distortion parameters.
+	# - points_3d with shape (n_points, 3) contains initial estimates of point coordinates in the world frame.
+	# - camera_ind with shape (n_observations,) contains indices of cameras (from 0 to n_cameras - 1) involved in each observation.
+	# - point_ind with shape (n_observations,) contatins indices of points (from 0 to n_points - 1) involved in each observation.
+	# - points_2d with shape (n_observations, 2) contains measured 2-D coordinates of points projected on images in each observations.
 
 	@timed
 	def bundle_adjustment(self, Ps, draw=False):
@@ -541,7 +394,7 @@ class VOdom:
 			ax.set_ylim(0, 1)
 			ax.set_zlim(0, 1)
 
-			plot_trajectory(ax, raw_poses, label='Unscaled', line_color='b', show_arrows=False)
+			# plot_trajectory(ax, raw_poses, label='Unscaled', line_color='b', show_arrows=False)
 			plot_trajectory(ax, scaled_poses, label='Scaled', line_color='r', show_arrows=False)
 			plot_trajectory(ax, self.known_poses, label='Truth', line_color='g--', show_arrows=False)
 
@@ -566,3 +419,5 @@ if __name__ == '__main__':
 	vodom.run(draw=True)
 	
 
+
+# %%
