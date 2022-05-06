@@ -63,11 +63,8 @@ class VOdom:
 		points1 = np.array(pts1)
 		points2 = np.array(pts2)
 
-		with timed('findFundamentalMat'):
-			F, status_mask = cv2.findFundamentalMat(
-				points1, points2, cv2.FM_RANSAC, 1, 0.99, 100000)
-
-		E = self.K.T @ F @ self.K
+		with timed('findEssentialMat'):
+			E, status_mask = cv2.findEssentialMat(points1, points2, self.K, cv2.RANSAC, .99, 1)
 
 		if draw:
 			print(
@@ -79,25 +76,6 @@ class VOdom:
 
 		return points1, points2, matches, E
 
-	# From book
-	@timed
-	def P_from_E(self, E):
-		w, u, vt = cv2.SVDecomp(E)
-
-		W = np.array([
-			[0, -1, 0],
-			[1, 0, 0],
-			[0, 0, 1]
-		])
-
-		R = u @ W @ vt
-		t = u[:, 2]
-
-		assert np.abs(np.linalg.det(R)) - \
-			1.0 <= 1e-07, "det(R) != ±1.0, this isn't a rotation matrix!"
-
-		P = np.hstack((R, t[:, np.newaxis]))
-		return P
 
 	# From book
 	def triangulate(
@@ -181,7 +159,10 @@ class VOdom:
 			[0, 1, 0, 0],
 			[0, 0, 1, 0]
 		])
-		P1 = self.P_from_E(E)
+		success, R, t, _ = cv2.recoverPose(E, points0, points1, self.K)
+		assert success, "recoverPose failed!"
+		P1 = np.hstack((R, t))
+		print(R, t, P1)
 		Ps = [P0, P1]
 		self.err = self.triangulate_points(1, points0, points1, P0, P1)
 
