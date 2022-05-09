@@ -1,7 +1,9 @@
 # %%
-## Setup ##
+## Setup Jupyter ##
 # %matplotlib notebook
-# %load_ext autoreload
+%load_ext autoreload
+# %% 
+## Setup ##
 %autoreload 2
 
 from functools import cached_property
@@ -111,6 +113,21 @@ class VOdom:
 	def K_inv(self):
 		return np.linalg.inv(self.K)
 
+	@property
+	def known_projections(self) -> Iterable[np.array]: # FIXME: projections is a misnomer
+		# First frame has no projection
+		prev_pose =  np.array([
+			[1, 0, 0, 0],
+			[0, 1, 0, 0],
+			[0, 0, 1, 0],
+			[0, 0, 0, 1],
+		])
+
+		# yield prev_pose
+		
+		for pose in self.known_poses:
+			yield np.linalg.solve(prev_pose, pose)
+
 	# From book
 	@timed
 	def triangulate_points(
@@ -195,8 +212,9 @@ class VOdom:
 
 		for P in Ps:
 			# Normal projection matrices are 3x4 to project to 2D homogenous space, but we don't want that
-			P_noproj = np.vstack((P, [0, 0, 0, 1]))
-			cur_pose = P_noproj @ cur_pose
+			if P.shape[0] == 3:
+				P = np.vstack((P, [0, 0, 0, 1]))
+			cur_pose = P @ cur_pose
 			poses.append(cur_pose)
 
 		return poses
@@ -299,16 +317,25 @@ class VOdom:
 	# But: what shape should C have? Not sure, trying 4x4, we'll see if that works.
 
 	@timed
-	def calculate_scale_factor(self, poses):
-		P_calculated = np.array(poses).reshape((len(poses), -1))
-		P_truth = np.array(self.known_poses).reshape((len(poses), -1))
+	def calculate_scale_factor(self, known_projs, projs, draw=True):
+		t_calc = np.array(projs)[:, 0:3, 3]
+		t_true = np.array(known_projs)[:, 0:3, 3]
 
-		assert P_calculated.shape == P_truth.shape
+		assert t_calc.shape == t_true.shape
 
-		C, *_ = np.linalg.lstsq(P_calculated, P_truth, rcond=None)
+		def _residual(scale_factors):
+			return (t_true - (t_calc * scale_factors)).ravel()
 
-		P_corrected = (P_calculated @ C).reshape((-1, 4, 4))
-		corrected_poses = list(P_corrected)
+		state0 = np.array([1, 1, 1])
+
+		res = least_squares(_residual, state0, verbose=2 if draw else 0)
+
+		adjustment = np.zeros((4, 4))
+		adjustment.fill(1)
+		adjustment[:3, 3] = res.x
+
+		corrected_poses = list(np.array(projs) * adjustment)
+
 		return corrected_poses
 
 	## Error Calculation
@@ -333,8 +360,9 @@ class VOdom:
 		print("Projections done!")
 		P_adjusted = self.bundle_adjustment(P_original, draw=draw)
 		print("Adjustment done")
+		P_adjusted = [np.vstack((x, [0,0,0,1])) for x in P_adjusted]
 		raw_poses = self.projections_to_poses(P_adjusted)
-		scaled_poses = self.calculate_scale_factor(raw_poses)
+		scaled_poses = self.calculate_scale_factor(self.known_poses, raw_poses)
 		x_err, y_err, z_err = self.calculate_error(self.known_poses, scaled_poses)
 		print(f"Mean error: X: {x_err:2.1f}%, Y: {y_err:2.1f}%, Z: {z_err:2.1f}%")
 
