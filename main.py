@@ -189,7 +189,7 @@ class VOdom:
         for frame_id, img in enumerate(self.imgs, start=2):
             with timed('Frame'):
                 img0, img1 = img1, img
-                points0, points1, matches, _ = self.detect_matches_and_E(
+                points0, points1, matches, E = self.detect_matches_and_E(
                     img0, img1, draw=False)
 
                 points3d_valid = []
@@ -202,7 +202,9 @@ class VOdom:
                         points2d_valid.append(point1)
 
                 P0 = P1
-                P1, R, t = self.P_from_PnP(points3d_valid, points2d_valid)
+                success, R, t, _ = cv2.recoverPose(E, points0, points1, self.K)
+                assert success, "failed to recover pose"
+                P1 = np.hstack((R, t))
                 Ps.append(P1)
 
                 # updates point cloud
