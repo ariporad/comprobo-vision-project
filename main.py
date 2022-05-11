@@ -12,6 +12,7 @@ import pykitti
 import cv2
 from functools import cached_property
 %load_ext autoreload
+np.set_printoptions(suppress=True)
 # %%
 ## Setup ##
 %autoreload 2
@@ -117,6 +118,7 @@ class VOdom:
 
     @property
     # FIXME: projections is a misnomer
+    # FIXME: This produces correct results for translation, but total nonsense for rotation (which we don't care about right now)
     def known_projections(self) -> Iterable[np.array]:
         # First frame has no projection
         prev_pose = np.array([
@@ -126,10 +128,9 @@ class VOdom:
             [0, 0, 0, 1],
         ])
 
-        # yield prev_pose
-
         for pose in self.known_poses:
-            yield np.linalg.solve(prev_pose, pose)
+            yield pose - prev_pose
+            prev_pose = pose
 
     # From book
     @timed
@@ -317,32 +318,26 @@ class VOdom:
         return Ps
 
     # Scale Factor
-    #
-    # The idea: for some scale factor $C$, the following must be true:
-    #     P_calc * C = P_true
-    # We know P_calc and P_true so solve for C (an approximate solution, not an exact one).
-    #
-    # But: what shape should C have? Not sure, trying 4x4, we'll see if that works.
 
     @timed
     def calculate_scale_factor(self, known_projs, projs, draw=True):
-        t_calc = np.array(projs)[:, 0:3, 3]
-        t_true = np.array(known_projs)[:, 0:3, 3]
+        ts_calc = np.array(projs)[:, 0:3, 3]
+        ts_true = np.array(known_projs)[:, 0:3, 3]
 
-        assert t_calc.shape == t_true.shape
+        assert ts_calc.shape == ts_true.shape
 
-        def _residual(scale_factors):
-            return (t_true - (t_calc * scale_factors)).ravel()
+        with np.errstate(divide='ignore'):
+            factors = np.linalg.norm(ts_true, axis=1) / \
+                np.linalg.norm(ts_calc, axis=1)
+        factors[~np.isfinite(factors)] = 1
 
-        state0 = np.array([1, 1, 1])
+        factors2 = np.zeros_like(projs)
+        factors2.fill(1)
+        factors2[:, 0, 3] = factors
+        factors2[:, 1, 3] = factors
+        factors2[:, 2, 3] = factors
 
-        res = least_squares(_residual, state0, verbose=2 if draw else 0)
-
-        adjustment = np.zeros((4, 4))
-        adjustment.fill(1)
-        adjustment[:3, 3] = res.x
-
-        corrected_poses = list(np.array(projs) * adjustment)
+        corrected_poses = list(np.array(projs) * factors2)
 
         return corrected_poses
 
@@ -355,38 +350,44 @@ class VOdom:
     # Where P is the robot's position (note that, currently, this doesn't consider orientation)
 
     def calculate_error(self, actual_poses, calculated_poses):
-        loc_odom = np.array(calculated_poses) @ np.transpose([0, 0, 0, 1])
-        loc_true = np.array(actual_poses) @ np.transpose([0, 0, 0, 1])
-        diff = ((loc_true - loc_odom) / loc_true)[:, :3]  # drop heterogenous 1
-        diff = diff[5:, :]  # drop first point (which is nonsense)
+        loc_odom = np.abs(np.array(calculated_poses)[:, :3, 3])
+        loc_true = np.abs(np.array(actual_poses)[:, :3, 3])
+        diff = ((loc_true - loc_odom) / loc_true)
+        diff = diff[5:, :]  # drop few points, which are usually garbage
         x_err, y_err, z_err = np.mean(np.abs(diff), axis=0) * 100
 
         return x_err, y_err, z_err
 
     def run(self, draw: bool = False):
         P_original = self.determine_projections()
-        print("Projections done!")
         P_adjusted = self.bundle_adjustment(P_original, draw=draw)
-        print("Adjustment done")
-        P_adjusted = [np.vstack((x, [0, 0, 0, 1])) for x in P_adjusted]
-        raw_poses = self.projections_to_poses(P_adjusted)
-        scaled_poses = self.calculate_scale_factor(self.known_poses, raw_poses)
+        P_adjusted = np.array([np.vstack((x, [0, 0, 0, 1]))
+                              for x in P_adjusted])
+        scaled_projs = np.array(self.calculate_scale_factor(
+            list(self.known_projections), P_adjusted))
+        self.scaled_projs = scaled_projs
         x_err, y_err, z_err = self.calculate_error(
-            self.known_poses, scaled_poses)
+            list(self.known_projections), scaled_projs)
+
+        scaled_poses = self.projections_to_poses(scaled_projs)
+
         print(
             f"Mean error: X: {x_err:2.1f}%, Y: {y_err:2.1f}%, Z: {z_err:2.1f}%")
+
+        # scaled_ts = scaled_projs[:, :3, 3]
+        # known_ts = np.array(list(self.known_projections))[:, :3, 3]
 
         if draw:
             fig = plt.figure()
             ax = fig.add_subplot(projection='3d')
-            ax.set_xlim(0, 1)
-            ax.set_ylim(0, 1)
-            ax.set_zlim(0, 1)
+            # ax.set_xlim(0, 1)
+            # ax.set_ylim(0, 1)
+            # ax.set_zlim(0, 1)
 
             plot_trajectory(ax, scaled_poses, label='Calculated',
-                            line_color='r', show_arrows=False)
+                            line_color='r', show_arrows=False, autoscale=False)
             plot_trajectory(ax, self.known_poses, label='Truth',
-                            line_color='g--', show_arrows=False)
+                            line_color='g--', show_arrows=False, autoscale=False)
 
             ax.set_xlabel('X')
             ax.set_ylabel('Y')
@@ -395,6 +396,27 @@ class VOdom:
             ax.view_init(0, 90)
             ax.set_title("Trajectory (Bird's-Eye View, Z is forward)")
             plt.show()
+
+            # plt.figure()
+            # plt.plot(scaled_ts[:, 0], label='Computed')
+            # plt.plot(known_ts[:, 0], label='Known')
+            # plt.title('X')
+            # plt.legend()
+            # plt.show()
+
+            # plt.figure()
+            # plt.plot(scaled_ts[:, 1], label='Computed')
+            # plt.plot(known_ts[:, 1], label='Known')
+            # plt.title('Y')
+            # plt.legend()
+            # plt.show()
+
+            # plt.figure()
+            # plt.plot(scaled_ts[:, 2], label='Computed')
+            # plt.plot(known_ts[:, 2], label='Known')
+            # plt.title('Z')
+            # plt.legend()
+            # plt.show()
 
     @classmethod
     def kitti(cls, sequence, start: int, stop: int, step: int = 1):
