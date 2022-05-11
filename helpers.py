@@ -9,6 +9,7 @@ _timings = defaultdict(lambda: [])
 
 ENABLE_TIMING: bool = False
 
+
 @contextmanager
 def timed_ctx(name: str = 'Timer', always_print: bool = False):
     if not ENABLE_TIMING:
@@ -68,32 +69,39 @@ def print_timings(clear: bool = True):
 def clear_timings():
     _timings.clear()
 
+
 def normalize(v, *args, **kwargs):
-	return v / np.linalg.norm(v, *args, **kwargs)
+    return v / np.linalg.norm(v, *args, **kwargs)
 
 
-def plot_trajectory(ax, poses, label: Optional[str] = None, scale_factor=1.0, line_color='r', arrow_color='b', arrow_size=5, arrow_prop=5, show_arrows=True, autoscale=True):
-	XYZ = np.array([P @ np.array([[0, 0, 0, 1]]).transpose()
-				   for P in poses]).squeeze(axis=2)
-	UVW = np.array([normalize(P @ np.array([[0, 0, 1, 1]]).transpose())
-				   * arrow_size for P in poses]).squeeze(axis=2)
+def projections_to_poses(Ps):
+    cur_pose = np.array([[1, 0, 0, 0], [0, 1, 0, 0],
+                        [0, 0, 1, 0], [0, 0, 0, 1]])
+    poses = []
 
-	XYZ *= float(scale_factor)
-	UVW *= float(scale_factor)
+    for P in Ps:
+        # Normal projection matrices are 3x4 to project to 2D homogenous space, but we don't want that
+        if P.shape[0] == 3:
+            P = np.vstack((P, [0, 0, 0, 1]))
+        cur_pose = P @ cur_pose
+        poses.append(cur_pose)
 
-	if autoscale:
-		MIN = np.min([0, np.min(XYZ), *ax.get_xlim(),
-					 *ax.get_ylim(), *ax.get_zlim()])
-		MAX = np.max([np.max(XYZ), *ax.get_xlim(), *
-					 ax.get_ylim(), *ax.get_zlim()]) * 1.10
+    return np.array(poses)
 
-	if show_arrows:
-		ax.quiver(
-		    XYZ[::arrow_prop, 0], XYZ[::arrow_prop, 1], XYZ[::arrow_prop, 2],
-		    UVW[::arrow_prop, 0], UVW[::arrow_prop, 1], UVW[::arrow_prop, 2], color=arrow_color)
-	ax.plot(XYZ[:, 0], XYZ[:, 1], XYZ[:, 2], line_color, label=label)
 
-	if autoscale:
-		ax.set_xlim(MIN, MAX)
-		ax.set_ylim(MIN, MAX)
-		ax.set_zlim(MIN, MAX)
+def outliers_to_nan(data, percentile: float = 90):
+    data = data.copy()
+    data_abs = np.abs(data)
+    cutoff = np.nanpercentile(data_abs, percentile)
+    mask = data_abs > cutoff
+    data[mask] = np.nan
+    return data
+
+
+def invert_P(P):
+    P = P.copy()
+    P[:, :3, :3] = P[:, :3, :3].transpose((0, 2, 1))
+    P[:, 0, 3] *= -1
+    P[:, 1, 3] *= -1
+    P[:, 2, 3] *= -1
+    return P

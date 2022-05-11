@@ -1,21 +1,20 @@
 # %%
 ## Setup Jupyter ##
 # %matplotlib notebook
+from cv2 import invert
+from graphics import GraphicsContext, NullGraphicsContext
 from point_cloud import PointCloud
-from helpers import timed, plot_trajectory
+from helpers import invert_P, timed, projections_to_poses
 from scipy.sparse import lil_matrix
 from scipy.optimize import least_squares
 from typing import Iterable, List
-from matplotlib import pyplot as plt
 import numpy as np
 import pykitti
 import cv2
 from functools import cached_property
-%load_ext autoreload
-np.set_printoptions(suppress=True)
+from enum import Enum, unique
 # %%
 ## Setup ##
-%autoreload 2
 
 
 KITTI_DIR = 'kitti'
@@ -33,35 +32,34 @@ class VOdom:
 
     point_cloud = PointCloud()
 
-    def __init__(self, imgs: Iterable[np.array], known_poses: Iterable[np.array], K: np.array):
+    gctx: GraphicsContext
+
+    def __init__(self, imgs: Iterable[np.array], known_poses: Iterable[np.array], K: np.array, gctx: GraphicsContext = NullGraphicsContext()):
         self.imgs = imgs
         self.known_poses = list(known_poses)
         self.K = K
+        self.gctx = gctx
 
     @timed
-    def detect_matches_and_E(self, img1, img2, draw=True):
+    def detect_matches_and_E(self, img0, img2):
         # Find Matches
         # From: https://stackoverflow.com/a/33670318
         with timed('SIFT'):
-            keypoints1, descriptors1 = self.sift.detectAndCompute(img1, None)
-            keypoints2, descriptors2 = self.sift.detectAndCompute(img2, None)
+            keypoints0, descriptors0 = self.sift.detectAndCompute(img0, None)
+            keypoints1, descriptors1 = self.sift.detectAndCompute(img2, None)
         with timed('Matching'):
-            matches = self.bf_matcher.match(descriptors1, descriptors2)
+            matches = self.bf_matcher.match(descriptors0, descriptors1)
 
-        if draw:
-            match_img = cv2.drawMatches(
-                img1, keypoints1, img2, keypoints2, matches, None, flags=2)
-            plt.figure(figsize=(9, 3))
-            plt.imshow(match_img)
-            plt.show()
+        self.gctx.set_img_feature_matches(
+            img0, keypoints0, img2, keypoints1, matches)
 
         # Find Points
         # From book
         pts1 = []
         pts2 = []
         for match in matches:
-            pts1.append(keypoints1[match.queryIdx].pt)
-            pts2.append(keypoints2[match.trainIdx].pt)
+            pts1.append(keypoints0[match.queryIdx].pt)
+            pts2.append(keypoints1[match.trainIdx].pt)
 
         points1 = np.array(pts1)
         points2 = np.array(pts2)
@@ -69,10 +67,6 @@ class VOdom:
         with timed('findEssentialMat'):
             E, status_mask = cv2.findEssentialMat(
                 points1, points2, self.K, cv2.RANSAC, .99, 1)
-
-        if draw:
-            print(
-                f"Keeping {np.sum(status_mask)}/{status_mask.size} points that match the fundamental matrix")
 
         status_mask = status_mask[:, 0] == 1
         points1 = points1[status_mask]
@@ -183,7 +177,6 @@ class VOdom:
         success, R, t, _ = cv2.recoverPose(E, points0, points1, self.K)
         assert success, "recoverPose failed!"
         P1 = np.hstack((R, t))
-        print(R, t, P1)
         Ps = [P0, P1]
         self.err = self.triangulate_points(1, points0, points1, P0, P1)
 
@@ -191,7 +184,7 @@ class VOdom:
             with timed('Frame'):
                 img0, img1 = img1, img
                 points0, points1, matches, E = self.detect_matches_and_E(
-                    img0, img1, draw=False)
+                    img0, img1)
 
                 points3d_valid = []
                 points2d_valid = []  # All in frame1
@@ -212,20 +205,6 @@ class VOdom:
                 self.triangulate_points(frame_id, points0, points1, P0, P1)
 
         return Ps
-
-    def projections_to_poses(self, Ps):
-        cur_pose = np.array([[1, 0, 0, 0], [0, 1, 0, 0],
-                            [0, 0, 1, 0], [0, 0, 0, 1]])
-        poses = []
-
-        for P in Ps:
-            # Normal projection matrices are 3x4 to project to 2D homogenous space, but we don't want that
-            if P.shape[0] == 3:
-                P = np.vstack((P, [0, 0, 0, 1]))
-            cur_pose = P @ cur_pose
-            poses.append(cur_pose)
-
-        return poses
 
     # Bundle Adjustment
     # Based on this tutorial: https://scipy-cookbook.readthedocs.io/items/bundle_adjustment.html, but mostly re-written (except as otherwise marked).
@@ -254,7 +233,7 @@ class VOdom:
         return (point2d_reproj - point2d_by_frame).ravel()
 
     @timed
-    def bundle_adjustment(self, Ps, draw=False):
+    def bundle_adjustment(self, Ps, quiet=True):
         num_frames = len(Ps)
         num_observations = self.point_cloud.num_observations
         num_points3d = self.point_cloud.num_points3d
@@ -274,14 +253,8 @@ class VOdom:
                 observation_id += 1
 
         state0 = np.hstack((frame_Ps.ravel(), points3d.ravel()))
-
-        if draw:
-            residual0 = self._residual(
-                state0, num_frames, num_points3d, frame_idxs, point3d_idxs, points2d)
-            plt.figure()
-            plt.plot(residual0)
-            plt.title('Residuals before bundle adjustment')
-            plt.show()
+        residual0 = self._residual(
+            state0, num_frames, num_points3d, frame_idxs, point3d_idxs, points2d)
 
         ### Generate Sparsity Matrix ###
         # This logic is completely taken from the SciPy tutorial
@@ -300,14 +273,10 @@ class VOdom:
             sparsity[2 * i + 1, (num_frames * self.FRAME_P_SIZE) +
                      (point3d_idxs * self.POINT3D_SIZE) + offset] = 1
 
-        res = least_squares(self._residual, state0, verbose=2 if draw else 0, x_scale='jac',
+        res = least_squares(self._residual, state0, verbose=2 if not quiet else 0, x_scale='jac',
                             jac_sparsity=sparsity, method='trf', args=(num_frames, num_points3d, frame_idxs, point3d_idxs, points2d))
 
-        if draw:
-            plt.figure()
-            plt.plot(res.fun)
-            plt.title('Residuals after bundle adjustment')
-            plt.show()
+        self.gctx.set_bundle_adjustment_residuals(residual0, res.fun)
 
         Ps_flat = res.x[:(self.FRAME_P_SIZE * num_frames)]
         points3d_flat = res.x[(self.FRAME_P_SIZE * num_frames):]
@@ -320,7 +289,7 @@ class VOdom:
     # Scale Factor
 
     @timed
-    def calculate_scale_factor(self, known_projs, projs, draw=True):
+    def calculate_scale_factor(self, known_projs, projs):
         ts_calc = np.array(projs)[:, 0:3, 3]
         ts_true = np.array(known_projs)[:, 0:3, 3]
 
@@ -352,84 +321,48 @@ class VOdom:
     def calculate_error(self, actual_poses, calculated_poses):
         loc_odom = np.abs(np.array(calculated_poses)[:, :3, 3])
         loc_true = np.abs(np.array(actual_poses)[:, :3, 3])
-        diff = ((loc_true - loc_odom) / loc_true)
-        diff = diff[5:, :]  # drop few points, which are usually garbage
-        x_err, y_err, z_err = np.mean(np.abs(diff), axis=0) * 100
+        return ((loc_true - loc_odom) / loc_true)
 
-        return x_err, y_err, z_err
+    def run(self):
+        self.gctx.set_ground_truth(self.known_poses, self.known_projections)
+        P_original = np.array(self.determine_projections())
 
-    def run(self, draw: bool = False):
-        P_original = self.determine_projections()
-        P_adjusted = self.bundle_adjustment(P_original, draw=draw)
+        # For some reason, OpenCV has an inverted Z-axis from the ground truth. We need to invert it
+        # to make them align, but we can't do that till after bundle adjustment.
+        P_original_uninv = P_original
+        P_original = invert_P(P_original)
+        self.gctx.set_projections_original(P_original)
+
+        # Do bundle adjustment for the sake of graphing, but don't actually use it
+        P_adjusted = self.bundle_adjustment(P_original_uninv)
         P_adjusted = np.array([np.vstack((x, [0, 0, 0, 1]))
                               for x in P_adjusted])
-        scaled_projs = np.array(self.calculate_scale_factor(
-            list(self.known_projections), P_adjusted))
-        self.scaled_projs = scaled_projs
-        x_err, y_err, z_err = self.calculate_error(
-            list(self.known_projections), scaled_projs)
+        P_adjusted = invert_P(P_adjusted)
+        self.gctx.set_projections_adjusted(P_adjusted)
 
-        scaled_poses = self.projections_to_poses(scaled_projs)
+        P_scaled = np.array(self.calculate_scale_factor(
+            list(self.known_projections), P_original))
+        self.gctx.set_projections_scaled(P_scaled)
+        error = self.calculate_error(list(self.known_projections), P_scaled)
+        self.gctx.set_error(error)
+        error = error[5:, :]  # drop few points, which are usually garbage
+        x_err, y_err, z_err = np.median(np.abs(error), axis=0) * 100
 
         print(
-            f"Mean error: X: {x_err:2.1f}%, Y: {y_err:2.1f}%, Z: {z_err:2.1f}%")
-
-        # scaled_ts = scaled_projs[:, :3, 3]
-        # known_ts = np.array(list(self.known_projections))[:, :3, 3]
-
-        if draw:
-            fig = plt.figure()
-            ax = fig.add_subplot(projection='3d')
-            # ax.set_xlim(0, 1)
-            # ax.set_ylim(0, 1)
-            # ax.set_zlim(0, 1)
-
-            plot_trajectory(ax, scaled_poses, label='Calculated',
-                            line_color='r', show_arrows=False, autoscale=False)
-            plot_trajectory(ax, self.known_poses, label='Truth',
-                            line_color='g--', show_arrows=False, autoscale=False)
-
-            ax.set_xlabel('X')
-            ax.set_ylabel('Y')
-            ax.set_zlabel('Z')
-
-            ax.view_init(0, 90)
-            ax.set_title("Trajectory (Bird's-Eye View, Z is forward)")
-            plt.show()
-
-            # plt.figure()
-            # plt.plot(scaled_ts[:, 0], label='Computed')
-            # plt.plot(known_ts[:, 0], label='Known')
-            # plt.title('X')
-            # plt.legend()
-            # plt.show()
-
-            # plt.figure()
-            # plt.plot(scaled_ts[:, 1], label='Computed')
-            # plt.plot(known_ts[:, 1], label='Known')
-            # plt.title('Y')
-            # plt.legend()
-            # plt.show()
-
-            # plt.figure()
-            # plt.plot(scaled_ts[:, 2], label='Computed')
-            # plt.plot(known_ts[:, 2], label='Known')
-            # plt.title('Z')
-            # plt.legend()
-            # plt.show()
+            f"Median error: X: {x_err:2.1f}%, Y: {y_err:2.1f}%, Z: {z_err:2.1f}%")
 
     @classmethod
-    def kitti(cls, sequence, start: int, stop: int, step: int = 1):
+    def kitti(cls, sequence, start: int, stop: int, step: int = 1, gctx: GraphicsContext = NullGraphicsContext()):
         if not isinstance(sequence, str):
             sequence = f"{sequence:02d}"
         kitti = pykitti.odometry(
             KITTI_DIR, sequence, frames=range(start, stop, step))
-        return VOdom((np.array(img) for img in kitti.cam0), kitti.poses, kitti.calib.K_cam0)
+        return VOdom((np.array(img) for img in kitti.cam0), kitti.poses, kitti.calib.K_cam0, gctx)
 
 
 if __name__ == '__main__':
     vodom = VOdom.kitti(1, 0, 50, 1)
-    vodom.run(draw=True)
+    vodom.run()
 
 
 # %%
