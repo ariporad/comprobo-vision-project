@@ -1,4 +1,3 @@
-from this import d
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Tuple, Optional, Iterable
@@ -93,24 +92,27 @@ class RealGraphicsContext(GraphicsContext):
     def plot_bundle_adjustment_residuals(self):
         raise NotImplemented
 
-    def plot_error(self, skip=2, percentile=90):
-        fig = plt.figure()
-        ax = fig.add_subplot()
-        err_percent = np.abs(self.error[skip:]) * 100
+    def plot_error(self, skip=2, end=None, percentile=90, ax=None):
+        if ax is None:
+            fig = plt.figure()
+            ax = fig.add_subplot()
+        err_percent = np.abs(self.error[skip:end]) * 100
         ax.plot(outliers_to_nan(
             err_percent[:, 0], percentile), label='X (Right)')
         ax.plot(outliers_to_nan(
             err_percent[:, 1], percentile), label='Y (Down)')
         ax.plot(outliers_to_nan(
             err_percent[:, 2], percentile), label='Z (Forward)')
-        ax.set_title(f"Accuracy (≤{percentile} Percentile)")
+        ax.set_title(
+            f"Accuracy (≤{percentile} Percentile)" if percentile != 100 else "Accuracy")
         ax.set_xlabel('Frame')
         ax.set_ylabel('Accuracy (Calculated Value as % of True Value)')
         ax.legend()
 
-    def plot_trajectories(self, trajectories: Iterable[str], title: str = "Trajectory (Bird's-Eye View)", autoscale: bool = False, arrows: bool = True):
-        fig = plt.figure()
-        ax = fig.add_subplot(projection='3d')
+    def plot_trajectories(self, trajectories: Iterable[str], title: str = "Trajectory (Bird's-Eye View)", autoscale: bool = False, arrows: bool = True, view=(180, -90), ax=None, legend=True):
+        if ax is None:
+            fig = plt.figure()
+            ax = fig.add_subplot(projection='3d')
 
         if autoscale:
             ax.set_xlim(0, 1)
@@ -144,9 +146,13 @@ class RealGraphicsContext(GraphicsContext):
         ax.set_ylabel('Y (Down)')
         ax.set_zlabel('Z (Forward)')
 
-        ax.view_init(180, -90)
-        ax.set_title(title)
-        ax.legend(loc='lower center')
+        if view is not None:
+            ax.view_init(*view)
+        if title is not None:
+            ax.set_title(title)
+        if legend:
+            ax.legend(loc=(legend if isinstance(
+                legend, str) else 'lower center'))
 
         # scaled_ts = scaled_projs[:, :3, 3]
         # known_ts = np.array(list(self.known_projections))[:, :3, 3]

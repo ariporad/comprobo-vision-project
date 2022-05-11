@@ -3,7 +3,6 @@ import functools
 from time import perf_counter
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import Optional
 
 _timings = defaultdict(lambda: [])
 
